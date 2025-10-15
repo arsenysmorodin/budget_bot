@@ -1,16 +1,16 @@
 import { Telegraf } from "telegraf";
 import dotenv from "dotenv";
+import db from "../db/index";
 
 dotenv.config();
 const bot = new Telegraf(process.env.BOT_TOKEN || "");
 
-// Пользователи из .env
-const USERS = {
+const USERS: Record<number, string> = {
   [Number(process.env.ARSENY_ID)]: "ARSENY",
   [Number(process.env.LERA_ID)]: "LERA",
 };
 
-// Главное меню
+// --- главное меню ---
 function showMainMenu(ctx: any) {
   ctx.reply("Главное меню:", {
     reply_markup: {
@@ -20,21 +20,7 @@ function showMainMenu(ctx: any) {
   });
 }
 
-// Категории
-const EXPENSE_CATEGORIES = [
-  ["Еда", "Транспорт"],
-  ["Подписки", "Развлечения"],
-  ["Дом", "Здоровье"],
-  ["Другое"],
-];
-
-const INCOME_CATEGORIES = [
-  ["Зарплата", "Подарок"],
-  ["Кэшбек", "Инвестиции"],
-  ["Продажи", "Другое"],
-];
-
-// Хранение состояний пользователей
+// --- состояние пользователей ---
 interface UserState {
   step:
     | "idle"
@@ -48,18 +34,37 @@ interface UserState {
     category?: string;
   };
 }
-
 const userStates: Record<number, UserState> = {};
 
-// Старт
-bot.start((ctx) => {
-  const username = USERS[ctx.from?.id || 0] || ctx.from?.first_name;
+// --- старт ---
+bot.start(async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const username = USERS[userId] || ctx.from?.first_name;
+
+  // Добавляем пользователя, если его нет
+  const getUser = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+  if (!getUser) {
+    db.prepare("INSERT INTO users (id, username) VALUES (?, ?)").run(
+      userId,
+      username
+    );
+  }
+
   ctx.reply(`Привет, ${username}!`);
   showMainMenu(ctx);
 });
 
-// Обработка текста
-bot.on("text", (ctx) => {
+// --- типы для данных ---
+interface Row {
+  type: "income" | "expense";
+  amount: number;
+  category: string;
+  date: string;
+}
+
+// --- логика операций ---
+bot.on("text", async (ctx) => {
   const userId = ctx.from?.id;
   if (!userId) return;
 
@@ -71,6 +76,7 @@ bot.on("text", (ctx) => {
   const text = ctx.message.text;
 
   switch (state.step) {
+    // --- главные команды ---
     case "idle":
       if (text === "Добавить расход") {
         state.step = "expense_amount";
@@ -85,38 +91,89 @@ bot.on("text", (ctx) => {
       }
 
       if (text === "Аналитика") {
-        return ctx.reply("Аналитика пока не реализована.");
-      }
+        const rows = db
+          .prepare("SELECT * FROM operations WHERE user_id = ?")
+          .all(userId) as Row[];
 
+        const income = rows
+          .filter((r) => r.type === "income")
+          .reduce((a, b) => a + b.amount, 0);
+        const expense = rows
+          .filter((r) => r.type === "expense")
+          .reduce((a, b) => a + b.amount, 0);
+        const balance = income - expense;
+
+        return ctx.reply(
+          `📊 Аналитика:\nДоход: ${income} ₽\nРасход: ${expense} ₽\nБаланс: ${balance} ₽`
+        );
+      }
       break;
 
-    // --- РАСХОД ---
+    // --- расходы ---
     case "expense_amount": {
-      const expenseAmount = parseFloat(text.replace(",", "."));
-      if (isNaN(expenseAmount)) return ctx.reply("Введите число.");
-      state.operation.amount = expenseAmount;
+      const amount = parseFloat(text.replace(",", "."));
+      if (isNaN(amount)) return ctx.reply("Введите число.");
+      state.operation.amount = amount;
       state.step = "expense_category";
+
+      // Загружаем категории из БД
+      const categories = db
+        .prepare("SELECT name FROM expense_categories ORDER BY name")
+        .all()
+        .map((r: any) => r.name);
+
+      if (categories.length === 0) {
+        return ctx.reply("Введите категорию расхода (пока нет сохранённых):");
+      }
+
       return ctx.reply("Выберите категорию расхода:", {
-        reply_markup: { keyboard: EXPENSE_CATEGORIES, resize_keyboard: true },
+        reply_markup: {
+          keyboard: categories.map((c) => [c]),
+          resize_keyboard: true,
+        },
       });
     }
 
     case "expense_category": {
       state.operation.category = text;
-      ctx.reply(
-        `✅ Расход добавлен:\nСумма: ${state.operation.amount}\nКатегория: ${state.operation.category}`
+
+      // Добавляем операцию
+      db.prepare(
+        "INSERT INTO operations (user_id, type, amount, category) VALUES (?, ?, ?, ?)"
+      ).run(
+        userId,
+        "expense",
+        state.operation.amount,
+        state.operation.category
       );
-      state.step = "idle";
-      state.operation = {};
+
+      // Добавляем новую категорию, если нет
+      db.prepare(
+        "INSERT OR IGNORE INTO expense_categories (name) VALUES (?)"
+      ).run(text);
+
+      ctx.reply(
+        `✅ Расход добавлен:\n${state.operation.amount} ₽ — ${state.operation.category}`
+      );
+
+      // Сброс состояния
+      userStates[userId] = { step: "idle", operation: {} };
       return showMainMenu(ctx);
     }
 
-    // --- ДОХОД ---
+    // --- доходы ---
     case "income_amount": {
-      const incomeAmount = parseFloat(text.replace(",", "."));
-      if (isNaN(incomeAmount)) return ctx.reply("Введите число.");
-      state.operation.amount = incomeAmount;
+      const amount = parseFloat(text.replace(",", "."));
+      if (isNaN(amount)) return ctx.reply("Введите число.");
+      state.operation.amount = amount;
       state.step = "income_category";
+
+      const INCOME_CATEGORIES = [
+        ["Зарплата", "Подарок"],
+        ["Кэшбек", "Инвестиции"],
+        ["Продажи", "Другое"],
+      ];
+
       return ctx.reply("Выберите категорию дохода:", {
         reply_markup: { keyboard: INCOME_CATEGORIES, resize_keyboard: true },
       });
@@ -124,11 +181,16 @@ bot.on("text", (ctx) => {
 
     case "income_category": {
       state.operation.category = text;
+
+      db.prepare(
+        "INSERT INTO operations (user_id, type, amount, category) VALUES (?, ?, ?, ?)"
+      ).run(userId, "income", state.operation.amount, state.operation.category);
+
       ctx.reply(
-        `💰 Доход добавлен:\nСумма: ${state.operation.amount}\nКатегория: ${state.operation.category}`
+        `💰 Доход добавлен:\n${state.operation.amount} ₽ — ${state.operation.category}`
       );
-      state.step = "idle";
-      state.operation = {};
+
+      userStates[userId] = { step: "idle", operation: {} };
       return showMainMenu(ctx);
     }
   }
@@ -136,4 +198,4 @@ bot.on("text", (ctx) => {
   ctx.reply("Выберите команду из меню.");
 });
 
-bot.launch().then(() => console.log("Бот запущен!"));
+bot.launch().then(() => console.log("🤖 Бот запущен с SQLite!"));
